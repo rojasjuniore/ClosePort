@@ -30,9 +30,43 @@ final class PortService {
     }
 
     func killProcess(pid: Int) -> Bool {
+        // Primero intentar kill normal (SIGTERM - permite cleanup)
+        if executeKill(pid: pid, signal: nil) {
+            // Esperar un momento y verificar si el proceso murió
+            usleep(100_000) // 100ms
+            if !isProcessRunning(pid: pid) {
+                return true
+            }
+        }
+
+        // Si sigue vivo, usar kill -9 (SIGKILL - fuerza cierre)
+        return executeKill(pid: pid, signal: "-9")
+    }
+
+    private func executeKill(pid: Int, signal: String?) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/kill")
-        process.arguments = [String(pid)]
+        if let signal = signal {
+            process.arguments = [signal, String(pid)]
+        } else {
+            process.arguments = [String(pid)]
+        }
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    private func isProcessRunning(pid: Int) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/kill")
+        process.arguments = ["-0", String(pid)] // Signal 0 = check if exists
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
 
