@@ -30,8 +30,10 @@ final class PortServiceTests: XCTestCase {
         XCTAssertEqual(ports[0].port, 6379)
         XCTAssertEqual(ports[0].command, "redis-ser")
         XCTAssertEqual(ports[0].pid, 748)
+        XCTAssertEqual(ports[0].address, "localhost")
         XCTAssertEqual(ports[1].port, 8080)
         XCTAssertEqual(ports[1].command, "node")
+        XCTAssertEqual(ports[1].address, "0.0.0.0")
     }
 
     func test_parseLsofOutput_withNilOutput_returnsEmptyArray() {
@@ -92,7 +94,7 @@ final class PortServiceTests: XCTestCase {
 
         XCTAssertEqual(ports.count, 1)
         XCTAssertEqual(ports[0].port, 3000)
-        XCTAssertEqual(ports[0].address, "[::1]")
+        XCTAssertEqual(ports[0].address, "localhost")
     }
 
     func test_parseLsofOutput_handlesWildcardAddress() {
@@ -103,6 +105,32 @@ final class PortServiceTests: XCTestCase {
 
         let ports = sut.parseLsofOutput(output)
 
-        XCTAssertEqual(ports[0].address, "*")
+        XCTAssertEqual(ports[0].address, "0.0.0.0")
+    }
+
+    func test_parseLsofOutput_filtersExcludedApps() {
+        let output = """
+        COMMAND     PID   USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+        Spotify     856 junior   72u  IPv4 0xbe7928f920d19cc1      0t0  TCP 127.0.0.1:7768 (LISTEN)
+        node      100 junior   15u  IPv4 0x123      0t0  TCP *:3000 (LISTEN)
+        """
+
+        let ports = sut.parseLsofOutput(output)
+
+        XCTAssertEqual(ports.count, 1)
+        XCTAssertEqual(ports[0].command, "node")
+    }
+
+    func test_parseLsofOutput_filtersNonDevPorts() {
+        let output = """
+        COMMAND     PID   USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+        someapp   100 junior   15u  IPv4 0x123      0t0  TCP *:63 (LISTEN)
+        node      200 junior   15u  IPv4 0x456      0t0  TCP *:3000 (LISTEN)
+        """
+
+        let ports = sut.parseLsofOutput(output)
+
+        XCTAssertEqual(ports.count, 1)
+        XCTAssertEqual(ports[0].port, 3000)
     }
 }

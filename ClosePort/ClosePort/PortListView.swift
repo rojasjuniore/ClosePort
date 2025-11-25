@@ -122,18 +122,18 @@ struct PortRow: View {
     var body: some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(":\(port.port)")
+                Text("\(port.address):\(port.port)")
                     .font(.system(.body, design: .monospaced))
                     .fontWeight(.medium)
 
-                Text("\(port.command) (PID: \(port.pid))")
+                Text("\(port.command)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
             Spacer()
 
-            Text(port.address)
+            Text("PID \(port.pid)")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
 
