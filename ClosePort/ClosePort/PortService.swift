@@ -43,6 +43,39 @@ final class PortService {
         return executeKill(pid: pid, signal: "-9")
     }
 
+    /// Mata el proceso de forma asíncrona con reintentos y verificación.
+    /// Llama a `onResult` en el main thread con `true` si se mató exitosamente.
+    func killProcessAsync(pid: Int, onResult: @escaping (Bool) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            // 1. SIGTERM
+            _ = executeKill(pid: pid, signal: nil)
+
+            // 2. Verificar con reintentos (hasta 500ms)
+            for _ in 0..<5 {
+                usleep(100_000) // 100ms
+                if !isProcessRunning(pid: pid) {
+                    DispatchQueue.main.async { onResult(true) }
+                    return
+                }
+            }
+
+            // 3. SIGKILL si sigue vivo
+            _ = executeKill(pid: pid, signal: "-9")
+
+            // 4. Verificar después de SIGKILL (hasta 300ms más)
+            for _ in 0..<3 {
+                usleep(100_000)
+                if !isProcessRunning(pid: pid) {
+                    DispatchQueue.main.async { onResult(true) }
+                    return
+                }
+            }
+
+            // 5. No se pudo matar
+            DispatchQueue.main.async { onResult(false) }
+        }
+    }
+
     private func executeKill(pid: Int, signal: String?) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/kill")

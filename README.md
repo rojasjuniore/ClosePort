@@ -11,27 +11,34 @@ A lightweight macOS menu bar app to view and kill processes using TCP ports. Per
 - Lives in your menu bar - no dock icon
 - Shows all TCP ports in LISTEN state
 - Displays process name, PID, and port number
-- One-click to kill any process
-- Lightweight (~100KB DMG)
-- Native SwiftUI app
+- One-click to kill any process with loading spinner
+- **Search/filter** ports by name, PID, or port number
+- **Auto-refresh** every 5 seconds
+- **Kill All** visible ports at once
+- **Confirmation dialog** before killing critical services (PostgreSQL, Redis, MongoDB, MySQL)
+- **macOS notifications** on kill success or failure
+- **Retry support** with visual feedback when a kill fails
+- Lightweight native SwiftUI app
 
 ## Screenshot
 
 ```
-┌─────────────────────────┐
-│ Open Ports          ↻  │
-├─────────────────────────┤
-│ :3000                   │
-│ node (PID: 1234)    ✕   │
-├─────────────────────────┤
-│ :8080                   │
-│ python (PID: 5678)  ✕   │
-├─────────────────────────┤
-│ :5432                   │
-│ postgres (PID: 789) ✕   │
-├─────────────────────────┤
-│ 3 port(s)        Quit   │
-└─────────────────────────┘
+┌──────────────────────────────┐
+│ Open Ports         🗑    ↻   │
+├──────────────────────────────┤
+│ 🔍 Filter by port, cmd...   │
+├──────────────────────────────┤
+│ localhost:3000    PID 1234   │
+│ node                     ✕   │
+├──────────────────────────────┤
+│ 0.0.0.0:8080     PID 5678   │
+│ python                   ✕   │
+├──────────────────────────────┤
+│ localhost:5432    PID 789    │
+│ postgres                 ✕   │
+├──────────────────────────────┤
+│ 3 port(s)           Quit     │
+└──────────────────────────────┘
 ```
 
 ## Installation
@@ -70,11 +77,14 @@ ClosePort uses the `lsof` command to list all TCP ports in LISTEN state:
 lsof -iTCP -sTCP:LISTEN -n -P
 ```
 
-When you click the X button, it sends a `kill` signal to terminate the process:
+When you click the X button, it sends a `SIGTERM` signal to gracefully terminate the process. If the process doesn't stop within 500ms, it escalates to `SIGKILL`:
 
 ```bash
-kill <PID>
+kill <PID>        # SIGTERM (graceful)
+kill -9 <PID>     # SIGKILL (force, if needed)
 ```
+
+The kill runs asynchronously with a loading spinner, and you get a macOS notification with the result.
 
 **Note:** ClosePort can only kill processes owned by your user. System processes require administrator privileges.
 

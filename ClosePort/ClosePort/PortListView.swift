@@ -1,17 +1,45 @@
 import SwiftUI
+import UserNotifications
 
 struct PortListView: View {
     @State private var ports: [Port] = []
+    @State private var killingPids: Set<Int> = []
+    @State private var failedPids: Set<Int> = []
+    @State private var searchText: String = ""
+    @State private var autoRefreshTimer: Timer?
+    @State private var portToConfirmKill: Port?
+    @State private var showKillAllConfirm = false
     private let portService = PortService()
+
+    private let criticalCommands: Set<String> = [
+        "postgres", "redis-ser", "mongod", "mysqld", "mariadbd"
+    ]
+
+    private var filteredPorts: [Port] {
+        guard !searchText.isEmpty else { return ports }
+        let query = searchText.lowercased()
+        return ports.filter {
+            $0.command.lowercased().contains(query) ||
+            String($0.port).contains(query) ||
+            String($0.pid).contains(query) ||
+            $0.address.lowercased().contains(query)
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             headerView
 
+            if !ports.isEmpty {
+                searchBar
+            }
+
             Divider()
 
             if ports.isEmpty {
                 emptyStateView
+            } else if filteredPorts.isEmpty {
+                noResultsView
             } else {
                 portListView
             }
@@ -20,8 +48,37 @@ struct PortListView: View {
 
             footerView
         }
-        .frame(width: 280)
-        .onAppear { refresh() }
+        .frame(width: 300)
+        .onAppear {
+            requestNotificationPermission()
+            refresh()
+            startAutoRefresh()
+        }
+        .onDisappear {
+            stopAutoRefresh()
+        }
+        .alert("Kill process?", isPresented: Binding(
+            get: { portToConfirmKill != nil },
+            set: { if !$0 { portToConfirmKill = nil } }
+        )) {
+            Button("Cancel", role: .cancel) { portToConfirmKill = nil }
+            Button("Kill", role: .destructive) {
+                if let port = portToConfirmKill {
+                    executeKill(port)
+                }
+                portToConfirmKill = nil
+            }
+        } message: {
+            if let port = portToConfirmKill {
+                Text("\(port.command) on port \(port.port) is a critical service. Are you sure?")
+            }
+        }
+        .alert("Kill all ports?", isPresented: $showKillAllConfirm) {
+            Button("Cancel", role: .cancel) {}
+            Button("Kill All", role: .destructive) { killAllPorts() }
+        } message: {
+            Text("This will terminate \(filteredPorts.count) process(es).")
+        }
     }
 
     // MARK: - Header
@@ -33,6 +90,16 @@ struct PortListView: View {
 
             Spacer()
 
+            if !filteredPorts.isEmpty {
+                Button(action: { showKillAllConfirm = true }) {
+                    Image(systemName: "trash")
+                        .font(.caption)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.red.opacity(0.7))
+                .help("Kill all visible ports")
+            }
+
             Button(action: refresh) {
                 Image(systemName: "arrow.clockwise")
             }
@@ -41,6 +108,22 @@ struct PortListView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+
+    // MARK: - Search
+
+    private var searchBar: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            TextField("Filter by port, command, PID...", text: $searchText)
+                .textFieldStyle(.plain)
+                .font(.caption)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
     }
 
     // MARK: - Empty State
@@ -62,15 +145,34 @@ struct PortListView: View {
         .frame(height: 100)
     }
 
+    private var noResultsView: some View {
+        VStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .font(.title2)
+                .foregroundStyle(.secondary)
+
+            Text("No matches for \"\(searchText)\"")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 80)
+    }
+
     // MARK: - Port List
 
     private var portListView: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(ports) { port in
-                    PortRow(port: port, onKill: { killPort(port) })
+                ForEach(filteredPorts) { port in
+                    PortRow(
+                        port: port,
+                        isKilling: killingPids.contains(port.pid),
+                        hasFailed: failedPids.contains(port.pid),
+                        onKill: { killPort(port) }
+                    )
 
-                    if port.id != ports.last?.id {
+                    if port.id != filteredPorts.last?.id {
                         Divider()
                             .padding(.leading, 12)
                     }
@@ -84,9 +186,15 @@ struct PortListView: View {
 
     private var footerView: some View {
         HStack {
-            Text("\(ports.count) port(s)")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            if searchText.isEmpty {
+                Text("\(ports.count) port(s)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("\(filteredPorts.count)/\(ports.count) port(s)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
             Spacer()
 
@@ -104,12 +212,86 @@ struct PortListView: View {
 
     private func refresh() {
         ports = portService.fetchPorts()
+        let activePids = Set(ports.map(\.pid))
+        killingPids.formIntersection(activePids)
+        failedPids.formIntersection(activePids)
     }
 
     private func killPort(_ port: Port) {
-        if portService.killProcess(pid: port.pid) {
-            refresh()
+        guard !killingPids.contains(port.pid) else { return }
+
+        if isCriticalProcess(port) {
+            portToConfirmKill = port
+        } else {
+            executeKill(port)
         }
+    }
+
+    private func executeKill(_ port: Port) {
+        failedPids.remove(port.pid)
+        killingPids.insert(port.pid)
+
+        portService.killProcessAsync(pid: port.pid) { success in
+            killingPids.remove(port.pid)
+            if success {
+                sendNotification(
+                    title: "Port \(port.port) closed",
+                    body: "\(port.command) (PID \(port.pid)) terminated"
+                )
+                refresh()
+            } else {
+                failedPids.insert(port.pid)
+                sendNotification(
+                    title: "Failed to close port \(port.port)",
+                    body: "\(port.command) (PID \(port.pid)) could not be killed"
+                )
+            }
+        }
+    }
+
+    private func killAllPorts() {
+        for port in filteredPorts {
+            guard !killingPids.contains(port.pid) else { continue }
+            executeKill(port)
+        }
+    }
+
+    private func isCriticalProcess(_ port: Port) -> Bool {
+        let cmd = port.command.lowercased()
+        return criticalCommands.contains(where: { cmd.hasPrefix($0) })
+    }
+
+    // MARK: - Auto Refresh
+
+    private func startAutoRefresh() {
+        autoRefreshTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { _ in
+            DispatchQueue.main.async { refresh() }
+        }
+    }
+
+    private func stopAutoRefresh() {
+        autoRefreshTimer?.invalidate()
+        autoRefreshTimer = nil
+    }
+
+    // MARK: - Notifications
+
+    private func requestNotificationPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    private func sendNotification(title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request)
     }
 }
 
@@ -117,6 +299,8 @@ struct PortListView: View {
 
 struct PortRow: View {
     let port: Port
+    let isKilling: Bool
+    let hasFailed: Bool
     let onKill: () -> Void
 
     var body: some View {
@@ -126,9 +310,17 @@ struct PortRow: View {
                     .font(.system(.body, design: .monospaced))
                     .fontWeight(.medium)
 
-                Text("\(port.command)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    Text("\(port.command)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    if hasFailed {
+                        Text("· Failed to kill")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+                }
             }
 
             Spacer()
@@ -137,12 +329,18 @@ struct PortRow: View {
                 .font(.caption2)
                 .foregroundStyle(.secondary)
 
-            Button(action: onKill) {
-                Image(systemName: "xmark.circle.fill")
-                    .foregroundStyle(.red.opacity(0.8))
+            if isKilling {
+                ProgressView()
+                    .scaleEffect(0.6)
+                    .frame(width: 16, height: 16)
+            } else {
+                Button(action: onKill) {
+                    Image(systemName: hasFailed ? "arrow.clockwise.circle.fill" : "xmark.circle.fill")
+                        .foregroundStyle(hasFailed ? .orange.opacity(0.8) : .red.opacity(0.8))
+                }
+                .buttonStyle(.plain)
+                .help(hasFailed ? "Retry kill process \(port.pid)" : "Kill process \(port.pid)")
             }
-            .buttonStyle(.plain)
-            .help("Kill process \(port.pid)")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
