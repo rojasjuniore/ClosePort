@@ -9,11 +9,8 @@ struct PortListView: View {
     @State private var autoRefreshTimer: Timer?
     @State private var portToConfirmKill: Port?
     @State private var showKillAllConfirm = false
+    @AppStorage("showAllPorts") private var showAllPorts = false
     private let portService = PortService()
-
-    private let criticalCommands: Set<String> = [
-        "postgres", "redis-ser", "mongod", "mysqld", "mariadbd"
-    ]
 
     private var filteredPorts: [Port] {
         guard !searchText.isEmpty else { return ports }
@@ -99,6 +96,12 @@ struct PortListView: View {
                 .foregroundStyle(.red.opacity(0.7))
                 .help("Kill all visible ports")
             }
+
+            Button(action: toggleShowAll) {
+                Image(systemName: showAllPorts ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+            }
+            .buttonStyle(.plain)
+            .help(showAllPorts ? "Showing all ports — click to show only dev ports" : "Showing only dev ports — click to show all")
 
             Button(action: refresh) {
                 Image(systemName: "arrow.clockwise")
@@ -210,8 +213,13 @@ struct PortListView: View {
 
     // MARK: - Actions
 
+    private func toggleShowAll() {
+        showAllPorts.toggle()
+        refresh()
+    }
+
     private func refresh() {
-        ports = portService.fetchPorts()
+        ports = portService.fetchPorts(devOnly: !showAllPorts)
         let activePids = Set(ports.map(\.pid))
         killingPids.formIntersection(activePids)
         failedPids.formIntersection(activePids)
@@ -220,7 +228,7 @@ struct PortListView: View {
     private func killPort(_ port: Port) {
         guard !killingPids.contains(port.pid) else { return }
 
-        if isCriticalProcess(port) {
+        if portService.isCriticalProcess(port) {
             portToConfirmKill = port
         } else {
             executeKill(port)
@@ -254,11 +262,6 @@ struct PortListView: View {
             guard !killingPids.contains(port.pid) else { continue }
             executeKill(port)
         }
-    }
-
-    private func isCriticalProcess(_ port: Port) -> Bool {
-        let cmd = port.command.lowercased()
-        return criticalCommands.contains(where: { cmd.hasPrefix($0) })
     }
 
     // MARK: - Auto Refresh
