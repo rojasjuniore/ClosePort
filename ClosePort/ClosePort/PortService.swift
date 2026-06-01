@@ -12,9 +12,16 @@ final class PortService {
         "loginwind", "coreaudio", "bluetoot", "WindowServer"
     ]
 
+    // Servicios críticos que requieren confirmación antes de matar
+    private let criticalCommands: Set<String> = [
+        "postgres", "redis-ser", "mongod", "mysqld", "mariadbd"
+    ]
+
     // Puertos comunes de desarrollo
     private let devPortRanges: [ClosedRange<Int>] = [
         3000...3999,   // React, Next.js, Rails
+        3306...3306,   // MySQL
+        3307...3307,   // MariaDB
         4000...4999,   // Phoenix, Ember
         5000...5999,   // Flask, ControlCenter (filtrado por app)
         5432...5432,   // PostgreSQL
@@ -24,23 +31,9 @@ final class PortService {
         27017...27017, // MongoDB
     ]
 
-    func fetchPorts() -> [Port] {
+    func fetchPorts(devOnly: Bool = true) -> [Port] {
         let output = runCommand("/usr/sbin/lsof", arguments: ["-iTCP", "-sTCP:LISTEN", "-n", "-P"])
-        return parseLsofOutput(output)
-    }
-
-    func killProcess(pid: Int) -> Bool {
-        // Primero intentar kill normal (SIGTERM - permite cleanup)
-        if executeKill(pid: pid, signal: nil) {
-            // Esperar un momento y verificar si el proceso murió
-            usleep(100_000) // 100ms
-            if !isProcessRunning(pid: pid) {
-                return true
-            }
-        }
-
-        // Si sigue vivo, usar kill -9 (SIGKILL - fuerza cierre)
-        return executeKill(pid: pid, signal: "-9")
+        return parseLsofOutput(output, devOnly: devOnly)
     }
 
     /// Mata el proceso de forma asíncrona con reintentos y verificación.
@@ -114,7 +107,7 @@ final class PortService {
 
     // MARK: - Internal (visible for testing)
 
-    func parseLsofOutput(_ output: String?) -> [Port] {
+    func parseLsofOutput(_ output: String?, devOnly: Bool = true) -> [Port] {
         guard let output = output, !output.isEmpty else { return [] }
 
         var ports: [Port] = []
@@ -148,8 +141,8 @@ final class PortService {
             guard let name = nameColumn,
                   let (address, port) = parseAddress(name) else { continue }
 
-            // Solo mostrar puertos de desarrollo (o todos si no está en rangos comunes)
-            if !isDevPort(port) { continue }
+            // Solo mostrar puertos de desarrollo cuando devOnly está activo
+            if devOnly && !isDevPort(port) { continue }
 
             guard !seenPorts.contains(port) else { continue }
             seenPorts.insert(port)
@@ -163,14 +156,14 @@ final class PortService {
         return ports.sorted { $0.port < $1.port }
     }
 
-    private func isExcludedApp(_ command: String) -> Bool {
+    func isExcludedApp(_ command: String) -> Bool {
         for excluded in excludedApps {
             if command.hasPrefix(excluded) { return true }
         }
         return false
     }
 
-    private func isDevPort(_ port: Int) -> Bool {
+    func isDevPort(_ port: Int) -> Bool {
         // Mostrar puertos en rangos de desarrollo
         for range in devPortRanges {
             if range.contains(port) { return true }
@@ -178,7 +171,12 @@ final class PortService {
         return false
     }
 
-    private func formatAddress(_ address: String) -> String {
+    func isCriticalProcess(_ port: Port) -> Bool {
+        let cmd = port.command.lowercased()
+        return criticalCommands.contains(where: { cmd.hasPrefix($0) })
+    }
+
+    func formatAddress(_ address: String) -> String {
         switch address {
         case "*", "0.0.0.0", "[::]":
             return "0.0.0.0"
