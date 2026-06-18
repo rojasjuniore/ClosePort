@@ -30,3 +30,8 @@ xcuserdata/
 
 # Claude
 .claude/
+
+# Firebase
+firebase-debug.log
+firebase-debug.*.log
+.firebase/
