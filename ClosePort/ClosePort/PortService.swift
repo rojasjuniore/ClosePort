@@ -1,5 +1,12 @@
 import Foundation
 
+/// Clave de deduplicación: un mismo proceso (pid) en un mismo puerto
+/// es una sola entrada, sin importar si escucha en IPv4 e IPv6.
+private struct PortKey: Hashable {
+    let pid: Int
+    let port: Int
+}
+
 final class PortService {
 
     // Apps del sistema que no queremos mostrar
@@ -111,7 +118,9 @@ final class PortService {
         guard let output = output, !output.isEmpty else { return [] }
 
         var ports: [Port] = []
-        var seenPorts: Set<Int> = []
+        // Dedup por (pid, port): un mismo proceso en IPv4+IPv6 es una sola fila,
+        // pero dos procesos distintos en el mismo puerto se muestran ambos.
+        var seen: [PortKey: Int] = [:] // PortKey -> índice en `ports`
 
         let lines = output.components(separatedBy: "\n")
 
@@ -119,7 +128,8 @@ final class PortService {
             guard !line.isEmpty else { continue }
 
             let columns = line.split(separator: " ", omittingEmptySubsequences: true)
-            guard columns.count >= 9 else { continue }
+            // Necesitamos al menos COMMAND, PID y la columna NAME (con ":").
+            guard columns.count >= 3 else { continue }
 
             let command = String(columns[0])
             guard let pid = Int(columns[1]) else { continue }
@@ -144,13 +154,24 @@ final class PortService {
             // Solo mostrar puertos de desarrollo cuando devOnly está activo
             if devOnly && !isDevPort(port) { continue }
 
-            guard !seenPorts.contains(port) else { continue }
-            seenPorts.insert(port)
-
             // Formatear address para mostrar "localhost" en vez de "127.0.0.1" o "*"
             let displayAddress = formatAddress(address)
 
-            ports.append(Port(command: command, pid: pid, port: port, address: displayAddress))
+            let key = PortKey(pid: pid, port: port)
+            if let existingIndex = seen[key] {
+                // Mismo proceso, mismo puerto (típicamente IPv4 + IPv6):
+                // decidir qué dirección conservar para la fila ya existente.
+                let existing = ports[existingIndex]
+                ports[existingIndex] = Port(
+                    command: command,
+                    pid: pid,
+                    port: port,
+                    address: preferredAddress(existing: existing.address, candidate: displayAddress)
+                )
+            } else {
+                seen[key] = ports.count
+                ports.append(Port(command: command, pid: pid, port: port, address: displayAddress))
+            }
         }
 
         return ports.sorted { $0.port < $1.port }
@@ -174,6 +195,27 @@ final class PortService {
     func isCriticalProcess(_ port: Port) -> Bool {
         let cmd = port.command.lowercased()
         return criticalCommands.contains(where: { cmd.hasPrefix($0) })
+    }
+
+    /// Decide qué dirección mostrar cuando un mismo proceso escucha el mismo
+    /// puerto en IPv4 e IPv6 (ej: "localhost" via 127.0.0.1 y via [::1], o
+    /// "0.0.0.0" via * y "localhost" via [::1]).
+    ///
+    /// `existing` es la dirección ya guardada; `candidate` la nueva línea.
+    /// Devuelve la que debe quedar visible en la fila.
+    ///
+    /// Prioridad: 0.0.0.0 (expuesto a toda la red) > IP específica > localhost.
+    /// En una herramienta de puertos, saber que algo escucha en todas las
+    /// interfaces es la info más relevante, así que esa dirección gana.
+    func preferredAddress(existing: String, candidate: String) -> String {
+        let rank: (String) -> Int = { addr in
+            switch addr {
+            case "0.0.0.0": return 2
+            case "localhost": return 0
+            default: return 1
+            }
+        }
+        return rank(candidate) > rank(existing) ? candidate : existing
     }
 
     func formatAddress(_ address: String) -> String {

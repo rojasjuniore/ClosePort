@@ -2,6 +2,11 @@ import SwiftUI
 import UserNotifications
 
 struct PortListView: View {
+    /// Cuando es true muestra un botón para abrir la ventana standalone.
+    /// Lo pasa el MenuBarExtra; la ventana en sí lo deja en false.
+    var showOpenWindowButton: Bool = false
+
+    @Environment(\.openWindow) private var openWindow
     @State private var ports: [Port] = []
     @State private var killingPids: Set<Int> = []
     @State private var failedPids: Set<Int> = []
@@ -45,7 +50,7 @@ struct PortListView: View {
 
             footerView
         }
-        .frame(width: 300)
+        .frame(minWidth: 300)
         .onAppear {
             requestNotificationPermission()
             refresh()
@@ -108,6 +113,14 @@ struct PortListView: View {
             }
             .buttonStyle(.plain)
             .help("Refresh")
+
+            if showOpenWindowButton {
+                Button(action: { openWindow(id: "main") }) {
+                    Image(systemName: "macwindow")
+                }
+                .buttonStyle(.plain)
+                .help("Open in a window")
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
