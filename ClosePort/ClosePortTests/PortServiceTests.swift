@@ -56,7 +56,9 @@ final class PortServiceTests: XCTestCase {
         XCTAssertTrue(ports.isEmpty)
     }
 
-    func test_parseLsofOutput_skipsDuplicatePorts() {
+    func test_parseLsofOutput_dedupsSamePidSamePort_acrossIPv4AndIPv6() {
+        // Un mismo proceso escuchando en IPv4 e IPv6 sobre el mismo puerto
+        // debe colapsar a UNA sola fila (dedup por pid:port).
         let output = """
         COMMAND     PID   USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
         redis-ser   748 junior    6u  IPv4 0xc1928f23ed27aa69      0t0  TCP 127.0.0.1:6379 (LISTEN)
@@ -67,6 +69,47 @@ final class PortServiceTests: XCTestCase {
 
         XCTAssertEqual(ports.count, 1)
         XCTAssertEqual(ports[0].port, 6379)
+        XCTAssertEqual(ports[0].pid, 748)
+    }
+
+    func test_parseLsofOutput_prefersExposedAddressOnDualStack() {
+        // Mismo proceso en localhost (IPv6) y 0.0.0.0 (IPv4 wildcard):
+        // la fila debe mostrar 0.0.0.0 por ser la más expuesta.
+        let output = """
+        COMMAND     PID   USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+        node      100 junior   15u  IPv6 0x1      0t0  TCP [::1]:3000 (LISTEN)
+        node      100 junior   16u  IPv4 0x2      0t0  TCP *:3000 (LISTEN)
+        """
+
+        let ports = sut.parseLsofOutput(output)
+
+        XCTAssertEqual(ports.count, 1)
+        XCTAssertEqual(ports[0].address, "0.0.0.0")
+    }
+
+    func test_preferredAddress_exposedWins() {
+        XCTAssertEqual(sut.preferredAddress(existing: "localhost", candidate: "0.0.0.0"), "0.0.0.0")
+        XCTAssertEqual(sut.preferredAddress(existing: "0.0.0.0", candidate: "localhost"), "0.0.0.0")
+        XCTAssertEqual(sut.preferredAddress(existing: "localhost", candidate: "192.168.1.10"), "192.168.1.10")
+    }
+
+    func test_parseLsofOutput_keepsDistinctProcessesOnSamePort() {
+        // BUG REPRODUCIDO: dos procesos DISTINTOS (postgres local + Docker)
+        // escuchando el mismo puerto. Con dedup por puerto solo se veía uno,
+        // y cuál se veía dependía del orden no determinista de lsof.
+        // Con dedup por pid:port deben aparecer LOS DOS.
+        let output = """
+        COMMAND     PID   USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+        postgres    884 junior    6u  IPv6 0x1      0t0  TCP [::1]:5432 (LISTEN)
+        com.docke 42243 junior    7u  IPv4 0x2      0t0  TCP *:5432 (LISTEN)
+        postgres    884 junior    8u  IPv4 0x3      0t0  TCP 127.0.0.1:5432 (LISTEN)
+        """
+
+        let ports = sut.parseLsofOutput(output)
+
+        XCTAssertEqual(ports.count, 2, "postgres local y Docker deben verse ambos")
+        let pids = Set(ports.map(\.pid))
+        XCTAssertEqual(pids, [884, 42243])
     }
 
     func test_parseLsofOutput_sortsPortsByNumber() {
@@ -132,5 +175,80 @@ final class PortServiceTests: XCTestCase {
 
         XCTAssertEqual(ports.count, 1)
         XCTAssertEqual(ports[0].port, 3000)
+    }
+
+    func test_parseLsofOutput_withDevOnlyFalse_includesNonDevPorts() {
+        let output = """
+        COMMAND     PID   USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+        someapp   100 junior   15u  IPv4 0x123      0t0  TCP *:63 (LISTEN)
+        node      200 junior   15u  IPv4 0x456      0t0  TCP *:3000 (LISTEN)
+        """
+
+        let ports = sut.parseLsofOutput(output, devOnly: false)
+
+        XCTAssertEqual(ports.count, 2)
+        XCTAssertEqual(ports.map(\.port), [63, 3000])
+    }
+
+    // MARK: - isDevPort Tests
+
+    func test_isDevPort_includesMySQLAndMariaDB() {
+        XCTAssertTrue(sut.isDevPort(3306))
+        XCTAssertTrue(sut.isDevPort(3307))
+    }
+
+    func test_isDevPort_includesCommonDatabasePorts() {
+        XCTAssertTrue(sut.isDevPort(5432))  // PostgreSQL
+        XCTAssertTrue(sut.isDevPort(6379))  // Redis
+        XCTAssertTrue(sut.isDevPort(27017)) // MongoDB
+    }
+
+    func test_isDevPort_respectsRangeBoundaries() {
+        XCTAssertTrue(sut.isDevPort(3000))
+        XCTAssertTrue(sut.isDevPort(3999))
+        XCTAssertFalse(sut.isDevPort(2999))
+        XCTAssertFalse(sut.isDevPort(63))
+    }
+
+    // MARK: - formatAddress Tests
+
+    func test_formatAddress_normalizesWildcards() {
+        XCTAssertEqual(sut.formatAddress("*"), "0.0.0.0")
+        XCTAssertEqual(sut.formatAddress("0.0.0.0"), "0.0.0.0")
+        XCTAssertEqual(sut.formatAddress("[::]"), "0.0.0.0")
+    }
+
+    func test_formatAddress_normalizesLoopback() {
+        XCTAssertEqual(sut.formatAddress("127.0.0.1"), "localhost")
+        XCTAssertEqual(sut.formatAddress("[::1]"), "localhost")
+    }
+
+    func test_formatAddress_passesThroughOtherAddresses() {
+        XCTAssertEqual(sut.formatAddress("192.168.1.10"), "192.168.1.10")
+    }
+
+    // MARK: - isExcludedApp Tests
+
+    func test_isExcludedApp_matchesByPrefix() {
+        XCTAssertTrue(sut.isExcludedApp("Spotify"))
+        XCTAssertTrue(sut.isExcludedApp("ControlCenter")) // prefix "ControlCe"
+    }
+
+    func test_isExcludedApp_doesNotMatchDevApps() {
+        XCTAssertFalse(sut.isExcludedApp("node"))
+        XCTAssertFalse(sut.isExcludedApp("postgres"))
+    }
+
+    // MARK: - isCriticalProcess Tests
+
+    func test_isCriticalProcess_matchesDatabaseServices() {
+        XCTAssertTrue(sut.isCriticalProcess(Port(command: "postgres", pid: 1, port: 5432, address: "localhost")))
+        XCTAssertTrue(sut.isCriticalProcess(Port(command: "mysqld", pid: 2, port: 3306, address: "localhost")))
+        XCTAssertTrue(sut.isCriticalProcess(Port(command: "mariadbd", pid: 3, port: 3307, address: "localhost")))
+        XCTAssertTrue(sut.isCriticalProcess(Port(command: "redis-ser", pid: 4, port: 6379, address: "localhost")))
+    }
+
+    func test_isCriticalProcess_doesNotMatchRegularProcesses() {
+        XCTAssertFalse(sut.isCriticalProcess(Port(command: "node", pid: 5, port: 3000, address: "localhost")))
     }
 }

@@ -1,5 +1,12 @@
 import Foundation
 
+/// Clave de deduplicación: un mismo proceso (pid) en un mismo puerto
+/// es una sola entrada, sin importar si escucha en IPv4 e IPv6.
+private struct PortKey: Hashable {
+    let pid: Int
+    let port: Int
+}
+
 final class PortService {
 
     // Apps del sistema que no queremos mostrar
@@ -12,9 +19,16 @@ final class PortService {
         "loginwind", "coreaudio", "bluetoot", "WindowServer"
     ]
 
+    // Servicios críticos que requieren confirmación antes de matar
+    private let criticalCommands: Set<String> = [
+        "postgres", "redis-ser", "mongod", "mysqld", "mariadbd"
+    ]
+
     // Puertos comunes de desarrollo
     private let devPortRanges: [ClosedRange<Int>] = [
         3000...3999,   // React, Next.js, Rails
+        3306...3306,   // MySQL
+        3307...3307,   // MariaDB
         4000...4999,   // Phoenix, Ember
         5000...5999,   // Flask, ControlCenter (filtrado por app)
         5432...5432,   // PostgreSQL
@@ -24,23 +38,42 @@ final class PortService {
         27017...27017, // MongoDB
     ]
 
-    func fetchPorts() -> [Port] {
+    func fetchPorts(devOnly: Bool = true) -> [Port] {
         let output = runCommand("/usr/sbin/lsof", arguments: ["-iTCP", "-sTCP:LISTEN", "-n", "-P"])
-        return parseLsofOutput(output)
+        return parseLsofOutput(output, devOnly: devOnly)
     }
 
-    func killProcess(pid: Int) -> Bool {
-        // Primero intentar kill normal (SIGTERM - permite cleanup)
-        if executeKill(pid: pid, signal: nil) {
-            // Esperar un momento y verificar si el proceso murió
-            usleep(100_000) // 100ms
-            if !isProcessRunning(pid: pid) {
-                return true
-            }
-        }
+    /// Mata el proceso de forma asíncrona con reintentos y verificación.
+    /// Llama a `onResult` en el main thread con `true` si se mató exitosamente.
+    func killProcessAsync(pid: Int, onResult: @escaping (Bool) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            // 1. SIGTERM
+            _ = executeKill(pid: pid, signal: nil)
 
-        // Si sigue vivo, usar kill -9 (SIGKILL - fuerza cierre)
-        return executeKill(pid: pid, signal: "-9")
+            // 2. Verificar con reintentos (hasta 500ms)
+            for _ in 0..<5 {
+                usleep(100_000) // 100ms
+                if !isProcessRunning(pid: pid) {
+                    DispatchQueue.main.async { onResult(true) }
+                    return
+                }
+            }
+
+            // 3. SIGKILL si sigue vivo
+            _ = executeKill(pid: pid, signal: "-9")
+
+            // 4. Verificar después de SIGKILL (hasta 300ms más)
+            for _ in 0..<3 {
+                usleep(100_000)
+                if !isProcessRunning(pid: pid) {
+                    DispatchQueue.main.async { onResult(true) }
+                    return
+                }
+            }
+
+            // 5. No se pudo matar
+            DispatchQueue.main.async { onResult(false) }
+        }
     }
 
     private func executeKill(pid: Int, signal: String?) -> Bool {
@@ -81,11 +114,13 @@ final class PortService {
 
     // MARK: - Internal (visible for testing)
 
-    func parseLsofOutput(_ output: String?) -> [Port] {
+    func parseLsofOutput(_ output: String?, devOnly: Bool = true) -> [Port] {
         guard let output = output, !output.isEmpty else { return [] }
 
         var ports: [Port] = []
-        var seenPorts: Set<Int> = []
+        // Dedup por (pid, port): un mismo proceso en IPv4+IPv6 es una sola fila,
+        // pero dos procesos distintos en el mismo puerto se muestran ambos.
+        var seen: [PortKey: Int] = [:] // PortKey -> índice en `ports`
 
         let lines = output.components(separatedBy: "\n")
 
@@ -93,7 +128,8 @@ final class PortService {
             guard !line.isEmpty else { continue }
 
             let columns = line.split(separator: " ", omittingEmptySubsequences: true)
-            guard columns.count >= 9 else { continue }
+            // Necesitamos al menos COMMAND, PID y la columna NAME (con ":").
+            guard columns.count >= 3 else { continue }
 
             let command = String(columns[0])
             guard let pid = Int(columns[1]) else { continue }
@@ -115,29 +151,40 @@ final class PortService {
             guard let name = nameColumn,
                   let (address, port) = parseAddress(name) else { continue }
 
-            // Solo mostrar puertos de desarrollo (o todos si no está en rangos comunes)
-            if !isDevPort(port) { continue }
-
-            guard !seenPorts.contains(port) else { continue }
-            seenPorts.insert(port)
+            // Solo mostrar puertos de desarrollo cuando devOnly está activo
+            if devOnly && !isDevPort(port) { continue }
 
             // Formatear address para mostrar "localhost" en vez de "127.0.0.1" o "*"
             let displayAddress = formatAddress(address)
 
-            ports.append(Port(command: command, pid: pid, port: port, address: displayAddress))
+            let key = PortKey(pid: pid, port: port)
+            if let existingIndex = seen[key] {
+                // Mismo proceso, mismo puerto (típicamente IPv4 + IPv6):
+                // decidir qué dirección conservar para la fila ya existente.
+                let existing = ports[existingIndex]
+                ports[existingIndex] = Port(
+                    command: command,
+                    pid: pid,
+                    port: port,
+                    address: preferredAddress(existing: existing.address, candidate: displayAddress)
+                )
+            } else {
+                seen[key] = ports.count
+                ports.append(Port(command: command, pid: pid, port: port, address: displayAddress))
+            }
         }
 
         return ports.sorted { $0.port < $1.port }
     }
 
-    private func isExcludedApp(_ command: String) -> Bool {
+    func isExcludedApp(_ command: String) -> Bool {
         for excluded in excludedApps {
             if command.hasPrefix(excluded) { return true }
         }
         return false
     }
 
-    private func isDevPort(_ port: Int) -> Bool {
+    func isDevPort(_ port: Int) -> Bool {
         // Mostrar puertos en rangos de desarrollo
         for range in devPortRanges {
             if range.contains(port) { return true }
@@ -145,7 +192,33 @@ final class PortService {
         return false
     }
 
-    private func formatAddress(_ address: String) -> String {
+    func isCriticalProcess(_ port: Port) -> Bool {
+        let cmd = port.command.lowercased()
+        return criticalCommands.contains(where: { cmd.hasPrefix($0) })
+    }
+
+    /// Decide qué dirección mostrar cuando un mismo proceso escucha el mismo
+    /// puerto en IPv4 e IPv6 (ej: "localhost" via 127.0.0.1 y via [::1], o
+    /// "0.0.0.0" via * y "localhost" via [::1]).
+    ///
+    /// `existing` es la dirección ya guardada; `candidate` la nueva línea.
+    /// Devuelve la que debe quedar visible en la fila.
+    ///
+    /// Prioridad: 0.0.0.0 (expuesto a toda la red) > IP específica > localhost.
+    /// En una herramienta de puertos, saber que algo escucha en todas las
+    /// interfaces es la info más relevante, así que esa dirección gana.
+    func preferredAddress(existing: String, candidate: String) -> String {
+        let rank: (String) -> Int = { addr in
+            switch addr {
+            case "0.0.0.0": return 2
+            case "localhost": return 0
+            default: return 1
+            }
+        }
+        return rank(candidate) > rank(existing) ? candidate : existing
+    }
+
+    func formatAddress(_ address: String) -> String {
         switch address {
         case "*", "0.0.0.0", "[::]":
             return "0.0.0.0"
