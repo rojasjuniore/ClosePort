@@ -14,7 +14,10 @@ struct PortListView: View {
     @State private var autoRefreshTimer: Timer?
     @State private var portToConfirmKill: Port?
     @State private var showKillAllConfirm = false
-    @AppStorage("showAllPorts") private var showAllPorts = false
+    /// Por defecto false = mostrar TODOS los puertos en LISTEN (el propósito de ClosePort).
+    /// Cuando es true, oculta puertos del sistema y deja solo rangos de desarrollo.
+    /// Clave nueva ("devOnlyFilter") para no arrastrar el default invertido del valor viejo guardado.
+    @AppStorage("devOnlyFilter") private var devOnlyFilter = false
     private let portService = PortService()
 
     private var filteredPorts: [Port] {
@@ -102,11 +105,11 @@ struct PortListView: View {
                 .help("Kill all visible ports")
             }
 
-            Button(action: toggleShowAll) {
-                Image(systemName: showAllPorts ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+            Button(action: toggleDevOnly) {
+                Image(systemName: devOnlyFilter ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
             }
             .buttonStyle(.plain)
-            .help(showAllPorts ? "Showing all ports — click to show only dev ports" : "Showing only dev ports — click to show all")
+            .help(devOnlyFilter ? "Showing only dev ports — click to show all" : "Showing all ports — click to filter to dev only")
 
             Button(action: refresh) {
                 Image(systemName: "arrow.clockwise")
@@ -226,13 +229,13 @@ struct PortListView: View {
 
     // MARK: - Actions
 
-    private func toggleShowAll() {
-        showAllPorts.toggle()
+    private func toggleDevOnly() {
+        devOnlyFilter.toggle()
         refresh()
     }
 
     private func refresh() {
-        ports = portService.fetchPorts(devOnly: !showAllPorts)
+        ports = portService.fetchPorts(devOnly: devOnlyFilter)
         let activePids = Set(ports.map(\.pid))
         killingPids.formIntersection(activePids)
         failedPids.formIntersection(activePids)
